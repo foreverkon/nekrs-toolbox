@@ -1,0 +1,42 @@
+@kernel void add_noise(const dlong N,
+    const dfloat time,
+    @ restrict const dfloat* X,
+    @ restrict const dfloat* Y,
+    @ restrict const dfloat* Z,
+    @ restrict dfloat* Fx,
+    @ restrict dfloat* Fy,
+    @ restrict dfloat* Fz)
+{
+    for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+        const dfloat x = X[n];
+        const dfloat y = Y[n];
+        const dfloat z = Z[n];
+
+        if (x >= p_noise_xmin && x <= p_noise_xmax && y >= p_noise_ymin && y <= p_noise_ymax) {
+            const dfloat twoPi = 6.2831853071795864769;
+            const dfloat xStar = x / p_noise_length_xy;
+            const dfloat yStar = y / p_noise_length_xy;
+            const dfloat zStar = z / p_noise_length_z;
+            const dfloat tStar = time * p_noise_velocity / p_noise_length_xy;
+            const dfloat tau = (time - p_noise_start) / p_noise_duration;
+            const dfloat envelope = sin(0.5 * twoPi * tau) * sin(0.5 * twoPi * tau);
+
+            const dfloat phase1 = twoPi * (p_noise_frequency_1x * xStar
+                                         + p_noise_frequency_1y * yStar
+                                         + p_noise_frequency_1z * zStar
+                                         + p_noise_frequency_1t * tStar);
+            const dfloat phase2 = twoPi * (p_noise_frequency_2x * xStar
+                                         + p_noise_frequency_2y * yStar
+                                         + p_noise_frequency_2z * zStar
+                                         + p_noise_frequency_2t * tStar);
+            const dfloat phase3 = twoPi * (p_noise_frequency_3x * xStar
+                                         + p_noise_frequency_3y * yStar
+                                         + p_noise_frequency_3z * zStar
+                                         + p_noise_frequency_3t * tStar);
+
+            Fx[n] += envelope * p_noise_forcing_scale * sin(phase1);
+            Fy[n] += envelope * p_noise_forcing_scale * sin(phase2);
+            Fz[n] += envelope * p_noise_forcing_scale * sin(phase3);
+        }
+    }
+}

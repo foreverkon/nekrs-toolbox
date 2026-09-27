@@ -1,0 +1,29 @@
+userSections = MONITOR, DIAGNOSTICS, STATISTICS, NOISE
+
+[GENERAL]
+checkpointEngine = adios
+
+[MONITOR]
+enable = true
+execution = auto
+pointsfile = monitor.points
+output = monitor
+start = 0
+sampleEvery = 1
+bufferSamples = 32
+
+[DIAGNOSTICS]
+enable = true
+execution = auto
+output = diagnostics.csv
+start = 0
+sampleEvery = 1
+
+[STATISTICS]
+enable = true
+execution = auto
+start = 0
+sampleEvery = 1
+
+[NOISE]
+enable = false

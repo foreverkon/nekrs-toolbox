@@ -1,0 +1,14 @@
+// z[n] = a1[n]*b1[n] + a2[n]*b2[n] + a3[n]*b3[n]
+@kernel void vec_dot(const dlong N,
+    @ restrict const dfloat* a1,
+    @ restrict const dfloat* a2,
+    @ restrict const dfloat* a3,
+    @ restrict const dfloat* b1,
+    @ restrict const dfloat* b2,
+    @ restrict const dfloat* b3,
+    @ restrict dfloat* z)
+{
+    for (dlong n = 0; n < N; ++n; @tile(p_blockSize, @outer, @inner)) {
+        z[n] = a1[n] * b1[n] + a2[n] * b2[n] + a3[n] * b3[n];
+    }
+}
