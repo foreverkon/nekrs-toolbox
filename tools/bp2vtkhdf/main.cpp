@@ -1089,6 +1089,44 @@ std::size_t WriteStaticFieldData(adios2::IO& io, adios2::Engine& engine,
     return totalIds;
 }
 
+std::size_t WriteMeshData(adios2::IO& io, adios2::Engine& engine, hid_t root,
+                          hid_t fieldData, const MeshLayout& mesh,
+                          std::size_t order, std::size_t chunkTuples)
+{
+    WriteSmallDataset<std::int64_t>(root, "NumberOfPoints", {static_cast<std::int64_t>(mesh.numberOfPoints)});
+    WriteSmallDataset<std::int64_t>(root, "NumberOfCells", {static_cast<std::int64_t>(mesh.numberOfCells)});
+    WriteSmallDataset<std::int64_t>(root, "NumberOfConnectivityIds", {static_cast<std::int64_t>(mesh.numberOfCells * 8)});
+    std::cout << "Writing shared geometry...\n";
+    if (mesh.type == "float") WriteGeometry<float>(io, engine, root, mesh, chunkTuples);
+    else WriteGeometry<double>(io, engine, root, mesh, chunkTuples);
+    return WriteStaticFieldData(io, engine, fieldData, mesh, order, chunkTuples);
+}
+
+std::size_t LinkMeshData(hid_t root, const fs::path& meshFile, const fs::path& output)
+{
+    const auto relativePath = fs::relative(meshFile, output.parent_path()).generic_string();
+    auto link = [&](const std::string& name) {
+        H5Check(H5Lcreate_external(relativePath.c_str(), ("/VTKHDF/" + name).c_str(),
+                                  root, name.c_str(), H5P_DEFAULT, H5P_DEFAULT),
+                "link " + name);
+    };
+    for (const auto& name : {"Points", "Connectivity", "Offsets", "Types",
+                            "NumberOfPoints", "NumberOfCells", "NumberOfConnectivityIds",
+                            "FieldData/polynomialOrder"})
+        link(name);
+    hid_t source = H5Valid(H5Fopen(meshFile.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), "open mesh file");
+    std::size_t globalIdCount = 0;
+    if (LinkExists(source, "VTKHDF/FieldData/globalElementIds"))
+    {
+        link("FieldData/globalElementIds");
+        hid_t ids = H5Valid(H5Dopen2(source, "VTKHDF/FieldData/globalElementIds", H5P_DEFAULT), "open IDs");
+        globalIdCount = DatasetDimensions(ids).front();
+        H5Dclose(ids);
+    }
+    H5Fclose(source);
+    return globalIdCount;
+}
+
 void UpdateFieldDataStepMetadata(hid_t fieldOffsets, hid_t fieldSizes,
                                  std::size_t oldCount, std::size_t newCount,
                                  std::size_t globalIdCount)
@@ -1144,6 +1182,8 @@ struct Options
 {
     fs::path input;
     fs::path output;
+    fs::path meshFile;
+    bool meshOnly = false;
     std::optional<std::vector<std::string>> fields;
     std::optional<std::vector<std::size_t>> steps;
     std::size_t chunkTuples = DEFAULT_READ_CHUNK;
@@ -1193,7 +1233,11 @@ Options ParseOptions(int argc, char** argv)
                 throw std::invalid_argument("missing value after " + argument);
             return argv[index];
         };
-        if (argument == "--fields")
+        if (argument == "--mesh-only")
+            options.meshOnly = true;
+        else if (argument == "--mesh")
+            options.meshFile = fs::absolute(nextValue());
+        else if (argument == "--fields")
         {
             options.fields = Split(nextValue(), ',');
             if (options.fields->empty())
@@ -1260,6 +1304,8 @@ Options ParseOptions(int argc, char** argv)
         else
             throw std::invalid_argument("unknown argument: " + argument);
     }
+    if (options.meshOnly && !options.meshFile.empty())
+        throw std::invalid_argument("Choose either --mesh-only or --mesh");
     return options;
 }
 
@@ -1268,6 +1314,8 @@ void PrintUsage(const char* executable)
     std::cerr
         << "Usage: " << executable << " INPUT.bp OUTPUT.vtkhdf [options]\n"
         << "Options:\n"
+        << "  --mesh-only            Export mesh geometry and metadata\n"
+        << "  --mesh FILE            Reference mesh geometry from FILE\n"
         << "  --fields NAME1,NAME2   Fields to add (default: all point fields)\n"
         << "  --steps 0,1,2          Source BP steps to add (default: all common steps)\n"
         << "  --chunk-tuples N       ADIOS2 read block size (default: "
@@ -1575,15 +1623,46 @@ int main(int argc, char** argv)
         io.SetEngine("BPFile");
         auto engine = io.Open(options.input.string(), adios2::Mode::ReadRandomAccess);
         const MeshLayout mesh = InspectMesh(io, engine);
-        const auto availableFields = IndexFields(DetectFields(io, engine, mesh));
-        if (availableFields.empty()) throw std::runtime_error("No point fields detected");
         const auto order = ReadScalar<std::uint32_t>(io, engine, "polynomialOrder");
         if (ReadScalar<std::uint32_t>(io, engine, "types") != VTK_HEXAHEDRON)
             throw std::runtime_error("Only VTK_HEXAHEDRON type 12 is supported");
-        const auto scalars = DetectScalars(io, engine);
-
         hid_t access = H5Valid(H5Pcreate(H5P_FILE_ACCESS), "create file access properties");
         H5Check(H5Pset_fclose_degree(access, H5F_CLOSE_STRONG), "set file close policy");
+        auto finish = [&]() {
+            H5Check(H5Fflush(file, H5F_SCOPE_GLOBAL), "flush output");
+            H5Check(H5Fclose(file), "close output"); file = -1;
+            engine.Close();
+            if (writePath != options.output)
+            {
+#ifdef _WIN32
+                fs::remove(options.output);
+#endif
+                fs::rename(writePath, options.output);
+            }
+            createdOutput = false;
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            std::cout << "Saved " << options.output << " in " << seconds << " s\n";
+            return 0;
+        };
+        if (options.meshOnly)
+        {
+            writePath = options.output;
+            if (options.overwrite && fs::exists(options.output)) writePath += ".partial";
+            fs::create_directories(writePath.parent_path());
+            file = H5Valid(H5Fcreate(writePath.string().c_str(), H5F_ACC_EXCL, H5P_DEFAULT, access), "create output");
+            H5Pclose(access);
+            createdOutput = true;
+            hid_t root = CreateGroup(file, "VTKHDF");
+            WriteStringAttribute(root, "Type", "UnstructuredGrid");
+            WriteAttribute<std::int64_t>(root, "Version", {2, 3});
+            CreateGroup(root, "PointData");
+            hid_t fieldData = CreateGroup(root, "FieldData");
+            WriteMeshData(io, engine, root, fieldData, mesh, order, options.chunkTuples);
+            return finish();
+        }
+        const auto availableFields = IndexFields(DetectFields(io, engine, mesh));
+        if (availableFields.empty()) throw std::runtime_error("No point fields detected");
+        const auto scalars = DetectScalars(io, engine);
         std::vector<std::int64_t> storedIndices;
         std::vector<std::string> existingFields;
         std::size_t globalIdCount = 0;
@@ -1687,13 +1766,9 @@ int main(int argc, char** argv)
             WriteAttribute<std::int64_t>(root, "Version", {2, 3});
             pointData = CreateGroup(root, "PointData");
             fieldData = CreateGroup(root, "FieldData");
-            WriteSmallDataset<std::int64_t>(root, "NumberOfPoints", {static_cast<std::int64_t>(mesh.numberOfPoints)});
-            WriteSmallDataset<std::int64_t>(root, "NumberOfCells", {static_cast<std::int64_t>(mesh.numberOfCells)});
-            WriteSmallDataset<std::int64_t>(root, "NumberOfConnectivityIds", {static_cast<std::int64_t>(mesh.numberOfCells * 8)});
-            std::cout << "Writing shared geometry...\n";
-            if (mesh.type == "float") WriteGeometry<float>(io, engine, root, mesh, options.chunkTuples);
-            else WriteGeometry<double>(io, engine, root, mesh, options.chunkTuples);
-            globalIdCount = WriteStaticFieldData(io, engine, fieldData, mesh, order, options.chunkTuples);
+            globalIdCount = options.meshFile.empty()
+                ? WriteMeshData(io, engine, root, fieldData, mesh, order, options.chunkTuples)
+                : LinkMeshData(root, options.meshFile, options.output);
             steps = CreateGroup(root, "Steps");
             WriteAttribute<std::int64_t>(steps, "NSteps", {0});
             pointOffsets = CreateGroup(steps, "PointDataOffsets");
@@ -1744,20 +1819,7 @@ int main(int argc, char** argv)
         UpdateFieldDataStepMetadata(fieldOffsets, fieldSizes, oldCount, newCount, globalIdCount);
         SetAttribute<std::int64_t>(steps, "NSteps", {static_cast<std::int64_t>(newCount)});
         SetAttribute<std::int64_t>(state, "InProgress", {0});
-        H5Check(H5Fflush(file, H5F_SCOPE_GLOBAL), "flush output");
-        H5Check(H5Fclose(file), "close output"); file = -1;
-        engine.Close();
-        if (writePath != options.output)
-        {
-#ifdef _WIN32
-            fs::remove(options.output);
-#endif
-            fs::rename(writePath, options.output);
-        }
-        createdOutput = false;
-        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-        std::cout << "Saved " << options.output << " in " << seconds << " s\n";
-        return 0;
+        return finish();
     }
     catch (const std::exception& error)
     {
